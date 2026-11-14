@@ -569,6 +569,19 @@ namespace
 {
     const BOOL ready = sTouchReady;
     const BOOL gui = MWGui::WindowManager::guiModeActive();
+    // the game's own views are added to the window later and would cover the overlay
+    UIView* parent = self.superview;
+    if (parent != nil && parent.subviews.lastObject != self)
+        [parent bringSubviewToFront:self];
+    static int lastLogged = -1;
+    const int state = (ready ? 1 : 0) | (gui ? 2 : 0) | (parent != nil ? 4 : 0);
+    if (state != lastLogged)
+    {
+        lastLogged = state;
+        Log(Debug::Info) << "Touch overlay: ready " << (ready ? "yes" : "no") << ", menus " << (gui ? "yes" : "no")
+                         << ", in window " << (parent != nil ? "yes" : "no") << ", frame "
+                         << (int)self.bounds.size.width << "x" << (int)self.bounds.size.height;
+    }
     if (self.hidden == ready)
         self.hidden = !ready;
     if (!ready)
