@@ -10,6 +10,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Put uploaded touch-control files in place
+        run: |
+          cp apps/openmw/ios/platform.m apps/openmw/ios/platform.mm
+          for f in apps/openmw/mwgui/windowmanagerimp*; do
+            case "$f" in
+              */windowmanagerimp.cpp|*/windowmanagerimp.hpp) continue;;
+            esac
+            if grep -q "guiModeActive" "$f"; then
+              if grep -q "^#ifndef MWGUI_WINDOWMANAGERIMP_H" "$f"; then
+                cp "$f" apps/openmw/mwgui/windowmanagerimp.hpp
+              else
+                cp "$f" apps/openmw/mwgui/windowmanagerimp.cpp
+              fi
+            fi
+          done
+          grep -c OMWTouchOverlay apps/openmw/ios/platform.mm
+          grep -c guiModeActive apps/openmw/mwgui/windowmanagerimp.cpp apps/openmw/mwgui/windowmanagerimp.hpp
+
       - name: Select newest Xcode 27
         run: |
           X=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
