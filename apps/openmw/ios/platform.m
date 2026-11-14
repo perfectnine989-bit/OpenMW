@@ -9,6 +9,7 @@
 
 #include <SDL_events.h>
 #include <SDL_hints.h>
+#include <SDL_keyboard.h>
 #include <SDL_syswm.h>
 
 #import <AVFAudio/AVFAudio.h>
@@ -20,6 +21,7 @@
 #include <os/proc.h>
 
 #include <cstdint>
+#include <cmath>
 #include <cstdlib>
 #include <iterator>
 #include <string>
@@ -27,6 +29,7 @@
 // target of the two-finger tap on the game view
 @interface OMWTwoFingerTap : NSObject
 - (void)tapped:(UITapGestureRecognizer*)recognizer;
+- (void)panned:(UIPanGestureRecognizer*)recognizer;
 @end
 
 // app-drawn touch controls over the game view: invisible floating stick (left), invisible look area (right), buttons
@@ -175,6 +178,13 @@ namespace
         tap.cancelsTouchesInView = NO;
         tap.delaysTouchesEnded = NO;
         [info.info.uikit.window addGestureRecognizer:tap];
+        UIPanGestureRecognizer* pan = [[UIPanGestureRecognizer alloc] initWithTarget:target action:@selector(panned:)];
+        pan.maximumNumberOfTouches = 1;
+        pan.cancelsTouchesInView = NO;
+        pan.delaysTouchesBegan = NO;
+        pan.delaysTouchesEnded = NO;
+        [info.info.uikit.window addGestureRecognizer:pan];
+        [pan release];
         sOverlay = [[OMWTouchOverlay alloc] initWithFrame:info.info.uikit.window.bounds];
         [info.info.uikit.window addSubview:sOverlay];
         [tap release];
@@ -291,6 +301,24 @@ namespace
         }
     }
 
+    // Escape (back out of a window or the settings) and close the on-screen keyboard
+    void pressEscape()
+    {
+        if (SDL_IsTextInputActive() == SDL_TRUE)
+            SDL_StopTextInput();
+        for (int i = 0; i < 2; ++i)
+        {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, i * (NSEC_PER_SEC / 20)), dispatch_get_main_queue(), ^{
+                SDL_Event event{};
+                event.type = i == 0 ? SDL_KEYDOWN : SDL_KEYUP;
+                event.key.state = i == 0 ? SDL_PRESSED : SDL_RELEASED;
+                event.key.keysym.scancode = SDL_SCANCODE_ESCAPE;
+                event.key.keysym.sym = SDLK_ESCAPE;
+                SDL_PushEvent(&event);
+            });
+        }
+    }
+
     constexpr CGFloat stickRadius = 55; // finger travel for full speed
     constexpr CGFloat lookGain = 0.22f; // stick deflection per point of finger movement per frame
 }
@@ -305,7 +333,8 @@ namespace
     CGPoint mLookLast;
     CGPoint mLookDelta;
     CADisplayLink* mLink;
-    BOOL mWasHidden;
+    UIButton* mBack;
+    BOOL mGui;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame
@@ -355,6 +384,24 @@ namespace
         [view release];
     }
 
+    // in menus: the only thing drawn, a big back button (also closes the keyboard)
+    mBack = [[UIButton buttonWithType:UIButtonTypeCustom] retain];
+    mBack.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.55];
+    mBack.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.6].CGColor;
+    mBack.layer.borderWidth = 2;
+    mBack.layer.cornerRadius = 28;
+    UIImage* backImage = [UIImage systemImageNamed:@"chevron.backward"];
+    if (backImage != nil)
+    {
+        [mBack setImage:backImage forState:UIControlStateNormal];
+        mBack.tintColor = UIColor.whiteColor;
+    }
+    else
+        [mBack setTitle:@"Back" forState:UIControlStateNormal];
+    [mBack addTarget:self action:@selector(backTapped) forControlEvents:UIControlEventTouchUpInside];
+    mBack.hidden = YES;
+    [self addSubview:mBack];
+
     mLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
     [mLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     return self;
@@ -366,6 +413,7 @@ namespace
     const UIEdgeInsets inset = self.safeAreaInsets;
     const CGRect area = UIEdgeInsetsInsetRect(self.bounds, UIEdgeInsetsMake(inset.top, MAX(inset.left, 16),
                                                   MAX(inset.bottom, 12), MAX(inset.right, 16)));
+    mBack.frame = CGRectMake(CGRectGetMaxX(area) - 64, CGRectGetMinY(area) + 8, 56, 56);
     size_t count = 0;
     ButtonSpec* specs = buttonSpecs(&count);
     for (size_t i = 0; i < count && i < mViews.count; ++i)
@@ -512,16 +560,29 @@ namespace
     setStick(GCInputRightThumbstick, 0, 0);
 }
 
+- (void)backTapped
+{
+    pressEscape();
+}
+
 - (void)tick:(CADisplayLink*)link
 {
-    const BOOL shouldHide = !sTouchReady || MWGui::WindowManager::guiModeActive();
-    if (shouldHide != self.hidden)
+    const BOOL ready = sTouchReady;
+    const BOOL gui = MWGui::WindowManager::guiModeActive();
+    if (self.hidden == ready)
+        self.hidden = !ready;
+    if (!ready)
+        return;
+    if (gui != mGui)
     {
-        if (shouldHide)
+        mGui = gui;
+        if (gui)
             [self reset];
-        self.hidden = shouldHide;
+        for (UIView* view in mViews)
+            view.hidden = gui;
+        mBack.hidden = !gui;
     }
-    if (shouldHide)
+    if (gui)
         return;
     // look: the finger's movement since the last frame is the right stick's deflection this frame
     CGFloat x = MAX(-1, MIN(1, mLookDelta.x * lookGain));
@@ -531,10 +592,15 @@ namespace
         setStick(GCInputRightThumbstick, x, -y);
 }
 
-// touches that hit no button go to the move/look areas; everything is ours while visible
+// in the game everything is ours; in menus only the back button, the rest goes to SDL (taps become mouse clicks)
 - (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event
 {
-    return self.hidden ? nil : self;
+    if (self.hidden)
+        return nil;
+    UIView* hit = [super hitTest:point withEvent:event];
+    if (mGui)
+        return hit == self ? nil : hit;
+    return hit;
 }
 @end
 
@@ -544,6 +610,29 @@ namespace
     // in the game the overlay has its own pause button, and two thumbs tapping at once must not open the menu
     if (MWGui::WindowManager::guiModeActive())
         pressStart();
+}
+
+// a finger drag in menus scrolls lists and text like a mouse wheel
+- (void)panned:(UIPanGestureRecognizer*)recognizer
+{
+    static CGFloat rest = 0;
+    if (!MWGui::WindowManager::guiModeActive())
+        return;
+    if (recognizer.state == UIGestureRecognizerStateBegan)
+        rest = 0;
+    rest += [recognizer translationInView:recognizer.view].y;
+    [recognizer setTranslation:CGPointZero inView:recognizer.view];
+    constexpr CGFloat step = 22; // points of finger travel per wheel notch
+    while (std::abs(rest) >= step)
+    {
+        SDL_Event event{};
+        event.type = SDL_MOUSEWHEEL;
+        event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+        // finger up -> content up -> wheel towards the user (negative)
+        event.wheel.y = rest > 0 ? 1 : -1;
+        SDL_PushEvent(&event);
+        rest += rest > 0 ? -step : step;
+    }
 }
 @end
 
@@ -610,6 +699,9 @@ void OMW::initIosPlatform()
 
 void OMW::configureMetalHud()
 {
+    // a phone screen needs a much bigger menu/text scale than a desktop; only while it is at the default 1.0
+    if (Settings::gui().mScalingFactor.get() == 1.0f)
+        Settings::gui().mScalingFactor.set(2.6f);
     // Off sets nothing; no overwrite: a launch environment can switch the HUD on or off
     const int mode = Settings::video().mMetalHud;
     if (mode == 0)
