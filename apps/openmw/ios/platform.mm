@@ -3,8 +3,11 @@
 #include <components/debug/debuglog.hpp>
 #include <components/settings/values.hpp>
 
+#include "../mwbase/environment.hpp"
+#include "../mwbase/windowmanager.hpp"
 #include "../mwgui/windowmanagerimp.hpp"
 #include "../mwrender/pingpongcanvas.hpp"
+
 #include "metalfx.hpp"
 
 #include <SDL_events.h>
@@ -45,7 +48,6 @@ namespace
     UIWindow* sWindow = nil;
     // decided once GameController has reported the devices connected at launch
     bool sDevicesReported = false;
-
     // memory log while the app runs: a long session's trend
     dispatch_source_t sMemoryTimer = nil;
 
@@ -83,11 +85,18 @@ namespace
         return false;
     }
 
-    // console-style menus unless a keyboard or mouse is connected without a game controller
+    // Console-style menus only with a real game controller. With touch only (or keyboard/mouse) the menus are the
+    // ordinary pointer ones, so a tap clicks them.
     bool wantsControllerMenus()
     {
-        const bool keyboardOrMouse = GCKeyboard.coalescedKeyboard != nil || hasUserMouse();
-        return hasGameController() || !keyboardOrMouse;
+        return hasGameController();
+    }
+
+    // true while a menu, dialog or window is open (the main menu counts)
+    bool guiOpen()
+    {
+        MWBase::WindowManager* windowManager = MWBase::Environment::get().getWindowManager();
+        return windowManager != nullptr && windowManager->isGuiMode();
     }
 
     void installOverlay()
@@ -118,7 +127,6 @@ namespace
             = sDevicesReported && GCKeyboard.coalescedKeyboard == nil && !hasUserMouse() && !hasGameController();
         if (wanted == (sTouchController != nil))
             return;
-
         if (!wanted)
         {
             removeOverlay();
@@ -128,7 +136,6 @@ namespace
             Log(Debug::Info) << "Touch controls off";
             return;
         }
-
         GCVirtualControllerConfiguration* configuration = [[GCVirtualControllerConfiguration alloc] init];
         configuration.elements = [NSSet set];
         GCVirtualController* controller = [[GCVirtualController alloc] initWithConfiguration:configuration];
@@ -162,7 +169,6 @@ namespace
         SDL_Window* window = SDL_GetWindowFromID(event->window.windowID);
         if (window == nullptr || !SDL_GetWindowWMInfo(window, &info))
             return 0;
-
         UIWindow* uiWindow = info.info.uikit.window;
         SDL_DelEventWatch(captureWindow, nullptr);
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -200,7 +206,8 @@ namespace
 namespace
 {
     // How far a finger has to move per second to push the look stick fully (points/s): smaller = more sensitive.
-    constexpr CGFloat lookFullSpeed = 650;
+    // Was 650. Try 200 for even faster turning, 400 for a bit slower.
+    constexpr CGFloat lookFullSpeed = 300;
     // The walking stick: the finger's distance from where it touched down for full deflection (points at scale 1).
     constexpr CGFloat stickRadiusBase = 64;
     // Touches left of this fraction of the screen width walk, the rest look.
@@ -215,7 +222,7 @@ namespace
 
     struct TouchButton
     {
-        NSString* label;
+        NSString* icon; // SF Symbol name (a vector icon built into iOS)
         NSString* element; // the virtual controller's element this button drives
         Anchor anchor;
         CGFloat dx, dy, radius; // distance from the anchor's corner (inside the safe area) to the centre, radius
@@ -224,7 +231,7 @@ namespace
         UITouch* touch = nil; // the finger holding it, not retained
         CFTimeInterval pressedAt = 0;
         CAShapeLayer* circle = nil; // owned by the overlay's layer
-        CATextLayer* text = nil;
+        CALayer* iconLayer = nil;
     };
 
     CGFloat clampUnit(CGFloat value)
@@ -266,42 +273,45 @@ namespace
         self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 
         _stickBase = [CAShapeLayer layer];
-        _stickBase.fillColor = [UIColor colorWithWhite:1 alpha:0.06].CGColor;
-        _stickBase.strokeColor = [UIColor colorWithWhite:1 alpha:0.30].CGColor;
-        _stickBase.lineWidth = 2;
+        _stickBase.fillColor = [UIColor colorWithWhite:1 alpha:0.03].CGColor;
+        _stickBase.strokeColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+        _stickBase.lineWidth = 1.5;
         [self.layer addSublayer:_stickBase];
         _stickKnob = [CAShapeLayer layer];
-        _stickKnob.fillColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
-        _stickKnob.strokeColor = [UIColor colorWithWhite:1 alpha:0.50].CGColor;
-        _stickKnob.lineWidth = 2;
+        _stickKnob.fillColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+        _stickKnob.strokeColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
+        _stickKnob.lineWidth = 1.5;
         [self.layer addSublayer:_stickKnob];
 
         // Layout of the buttons (distances in points at scale 1; edit here to move them). The right thumb also looks
         // around: any spot that is not a button is look area.
+        // Format: icon, controller element, corner, dx, dy, radius.
         const TouchButton specs[] = {
-            { @"Атака", GCInputRightTrigger, BottomRight, 78, 88, 46 },
-            { @"Действие", GCInputButtonA, BottomRight, 178, 56, 34 },
-            { @"Прыжок", GCInputLeftTrigger, BottomRight, 58, 194, 34 },
-            { @"Инвент.", GCInputButtonB, BottomRight, 172, 150, 28 },
-            { @"Оружие", GCInputButtonX, BottomRight, 262, 100, 28 },
-            { @"Магия", GCInputButtonY, BottomRight, 250, 196, 28 },
-            { @"Меню", GCInputButtonMenu, TopRight, 38, 38, 24 },
-            { @"Журнал", GCInputLeftShoulder, TopRight, 100, 38, 24 },
-            { @"Отдых", GCInputRightShoulder, TopRight, 162, 38, 24 },
-            { @"Красться", GCInputLeftThumbstickButton, TopLeft, 44, 38, 26 },
-            { @"Вид", GCInputRightThumbstickButton, TopLeft, 112, 38, 24 },
+            { @"burst.fill", GCInputRightTrigger, BottomRight, 78, 88, 46 }, // attack
+            { @"hand.tap.fill", GCInputButtonA, BottomRight, 178, 56, 34 }, // action
+            { @"arrow.up", GCInputLeftTrigger, BottomRight, 58, 194, 34 }, // jump
+            { @"bag.fill", GCInputButtonB, BottomRight, 172, 150, 28 }, // inventory
+            { @"shield.fill", GCInputButtonX, BottomRight, 262, 100, 28 }, // weapon
+            { @"sparkles", GCInputButtonY, BottomRight, 250, 196, 28 }, // magic
+            { @"line.3.horizontal", GCInputButtonMenu, TopRight, 38, 38, 24 }, // menu
+            { @"book.fill", GCInputLeftShoulder, TopRight, 100, 38, 24 }, // journal
+            { @"eye.slash.fill", GCInputLeftThumbstickButton, TopLeft, 44, 38, 26 }, // sneak
         };
+        UIImageSymbolConfiguration* symbolConfiguration =
+            [UIImageSymbolConfiguration configurationWithPointSize:48 weight:UIImageSymbolWeightMedium];
         for (TouchButton button : specs)
         {
             button.circle = [CAShapeLayer layer];
-            button.circle.lineWidth = 2;
-            button.circle.strokeColor = [UIColor colorWithWhite:1 alpha:0.55].CGColor;
+            button.circle.lineWidth = 1.5;
+            button.circle.strokeColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
             [self.layer addSublayer:button.circle];
-            button.text = [CATextLayer layer];
-            button.text.string = button.label;
-            button.text.alignmentMode = kCAAlignmentCenter;
-            button.text.foregroundColor = UIColor.whiteColor.CGColor;
-            [self.layer addSublayer:button.text];
+            button.iconLayer = [CALayer layer];
+            button.iconLayer.contentsGravity = kCAGravityResizeAspect;
+            button.iconLayer.opacity = 0.6;
+            UIImage* image = [UIImage systemImageNamed:button.icon withConfiguration:symbolConfiguration];
+            image = [image imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal];
+            button.iconLayer.contents = (id)image.CGImage;
+            [self.layer addSublayer:button.iconLayer];
             _buttons.push_back(button);
             [self styleButton:_buttons.back() pressed:NO];
         }
@@ -316,6 +326,15 @@ namespace
 {
     [self teardown];
     [super dealloc];
+}
+
+// While a menu or dialog is open, touches that are not on a button go through to the game window underneath, where
+// SDL turns them into ordinary clicks. Buttons stay usable.
+- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event
+{
+    if (guiOpen() && [self buttonAt:point] == nullptr)
+        return nil;
+    return [super hitTest:point withEvent:event];
 }
 
 // stops the display link (it retains this view) and lets go of every control
@@ -379,11 +398,9 @@ namespace
         button.scaledRadius = radius;
         button.circle.frame = CGRectMake(button.center.x - radius, button.center.y - radius, 2 * radius, 2 * radius);
         button.circle.path = [UIBezierPath bezierPathWithOvalInRect:button.circle.bounds].CGPath;
-        const CGFloat font = std::max<CGFloat>(8, radius * 0.38);
-        button.text.fontSize = font;
-        button.text.contentsScale = screenScale;
-        button.text.frame
-            = CGRectMake(button.center.x - radius, button.center.y - font * 0.62, 2 * radius, font * 1.3);
+        const CGFloat side = radius * 1.0;
+        button.iconLayer.contentsScale = screenScale;
+        button.iconLayer.frame = CGRectMake(button.center.x - side / 2, button.center.y - side / 2, side, side);
     }
     [self updateStickLayers];
     [CATransaction commit];
@@ -393,7 +410,8 @@ namespace
 {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    button.circle.fillColor = [UIColor colorWithWhite:1 alpha:pressed ? 0.42 : 0.16].CGColor;
+    button.circle.fillColor = [UIColor colorWithWhite:1 alpha:pressed ? 0.30 : 0.05].CGColor;
+    button.iconLayer.opacity = pressed ? 0.95 : 0.6;
     [CATransaction commit];
 }
 
