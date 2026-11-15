@@ -1,0 +1,101 @@
+name: iOS IPA (unsigned)
+
+# Manual run: Actions tab -> "iOS IPA (unsigned)" -> Run workflow.
+# Builds the iOS port on a macOS 27 / Xcode 27 runner and publishes an unsigned IPA as a GitHub prerelease,
+# to be signed afterwards with your own signing service.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-ipa
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  ipa:
+    runs-on: xcode-27
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Tool versions
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          uname -m
+
+      - name: Install host tools
+        run: brew install cmake ninja meson xcodegen pkgconf python bison@3.8
+
+      # Xcode 26+ keeps the Metal compiler as a separate component; harmless if it is already there
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      # CI has no Apple account: build the device app without code signing (the IPA is signed later, elsewhere)
+      - name: Disable code signing in the build script
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path("ios/build.sh")
+          s = p.read_text()
+          old = 'DEVELOPMENT_TEAM="$TEAM_ID" "$@"'
+          assert old in s, "xcodebuild line not found"
+          s = s.replace(old, 'DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" "$@"')
+          old = 'codesign --remove-signature "$out/Payload/OpenMW.app"'
+          assert old in s, "codesign line not found"
+          s = s.replace(old, old + " || true")
+          p.write_text(s)
+          PY
+
+      - name: Restore dependency cache
+        id: deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ios-deps/artifacts
+            ios-deps/build
+          key: ios-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('ios-deps/recipes/**', 'ios-deps/patches/**', 'ios-deps/build-deps.sh') }}
+
+      - name: Build dependencies (first run takes long)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: ./build-ios.sh deps build all device
+
+      - name: Save dependency cache
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ios-deps/artifacts
+            ios-deps/build
+          key: ${{ steps.deps-cache.outputs.cache-primary-key }}
+
+      - name: Build the app
+        run: ./build-ios.sh build device --release
+
+      - name: Package unsigned IPA
+        run: ./build-ios.sh ipa --release --unsigned
+
+      - name: Upload IPA as workflow artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: OpenMW-unsigned-ipa
+          path: DerivedData/ipa/OpenMW-unsigned.ipa
+
+      - name: Publish IPA as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-build-${{ github.run_number }}
+          name: iOS build ${{ github.run_number }}
+          prerelease: true
+          files: DerivedData/ipa/OpenMW-unsigned.ipa
+          body: |
+            Unsigned IPA of the iOS port with the app-drawn touch controls. Sign it with your own signing service.
+            Source: this repository at commit ${{ github.sha }} (GPLv3).
