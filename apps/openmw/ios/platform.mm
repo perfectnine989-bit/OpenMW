@@ -99,6 +99,58 @@ namespace
         return windowManager != nullptr && windowManager->isGuiMode();
     }
 
+    // the Menu button is not an element a virtual controller can press, so it sends the Escape key (OpenMW's game menu:
+    // save, load, options) straight to the engine instead
+    bool isKeyButton(NSString* element)
+    {
+        return [element isEqualToString:@"key:escape"];
+    }
+
+    void pushKey(SDL_Scancode scancode, bool down)
+    {
+        SDL_Event event{};
+        event.type = down ? SDL_KEYDOWN : SDL_KEYUP;
+        event.key.state = down ? SDL_PRESSED : SDL_RELEASED;
+        event.key.keysym.scancode = scancode;
+        event.key.keysym.sym = SDL_GetKeyFromScancode(scancode);
+        SDL_PushEvent(&event);
+    }
+
+    // While a menu is open the overlay turns finger gestures into ordinary mouse input for the engine.
+    void pushMouseMotion(CGPoint to, CGPoint from, bool pressed)
+    {
+        SDL_Event event{};
+        event.type = SDL_MOUSEMOTION;
+        event.motion.state = pressed ? SDL_BUTTON_LMASK : 0;
+        event.motion.x = static_cast<Sint32>(to.x);
+        event.motion.y = static_cast<Sint32>(to.y);
+        event.motion.xrel = static_cast<Sint32>(to.x - from.x);
+        event.motion.yrel = static_cast<Sint32>(to.y - from.y);
+        SDL_PushEvent(&event);
+    }
+
+    void pushMouseButton(CGPoint at, bool down)
+    {
+        SDL_Event event{};
+        event.type = down ? SDL_MOUSEBUTTONDOWN : SDL_MOUSEBUTTONUP;
+        event.button.button = SDL_BUTTON_LEFT;
+        event.button.state = down ? SDL_PRESSED : SDL_RELEASED;
+        event.button.clicks = 1;
+        event.button.x = static_cast<Sint32>(at.x);
+        event.button.y = static_cast<Sint32>(at.y);
+        SDL_PushEvent(&event);
+    }
+
+    // steps > 0 scrolls up, steps < 0 scrolls down
+    void pushMouseWheel(int steps)
+    {
+        SDL_Event event{};
+        event.type = SDL_MOUSEWHEEL;
+        event.wheel.y = steps;
+        event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+        SDL_PushEvent(&event);
+    }
+
     void installOverlay()
     {
         if (sOverlay != nil || sTouchController == nil || sWindow == nil)
@@ -238,6 +290,61 @@ namespace
     {
         return std::max<CGFloat>(-1, std::min<CGFloat>(1, value));
     }
+
+    // Vector icons drawn in code (white on transparent) for what iOS has no symbol for.
+    UIImage* drawnIcon(NSString* name)
+    {
+        UIGraphicsImageRendererFormat* format = [UIGraphicsImageRendererFormat preferredFormat];
+        format.opaque = NO;
+        UIGraphicsImageRenderer* renderer =
+            [[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(96, 96) format:format] autorelease];
+        const bool swords = [name isEqualToString:@"custom.swords"];
+        return [renderer imageWithActions:^(UIGraphicsImageRendererContext* rendererContext) {
+            CGContextRef context = rendererContext.CGContext;
+            CGContextSetFillColorWithColor(context, UIColor.whiteColor.CGColor);
+            CGContextSetStrokeColorWithColor(context, UIColor.whiteColor.CGColor);
+            if (swords)
+            {
+                // two swords crossed in an X: blade, cross guard, grip, pommel
+                for (const CGFloat angle : { M_PI / 4, -M_PI / 4 })
+                {
+                    CGContextSaveGState(context);
+                    CGContextTranslateCTM(context, 48, 48);
+                    CGContextRotateCTM(context, angle);
+                    CGContextBeginPath(context);
+                    CGContextMoveToPoint(context, 0, -45);
+                    CGContextAddLineToPoint(context, 6, -31);
+                    CGContextAddLineToPoint(context, 6, 14);
+                    CGContextAddLineToPoint(context, -6, 14);
+                    CGContextAddLineToPoint(context, -6, -31);
+                    CGContextClosePath(context);
+                    CGContextFillPath(context);
+                    CGContextFillRect(context, CGRectMake(-18, 16, 36, 7));
+                    CGContextFillRect(context, CGRectMake(-3.5, 24, 7, 15));
+                    CGContextFillEllipseInRect(context, CGRectMake(-6, 38, 12, 12));
+                    CGContextRestoreGState(context);
+                }
+            }
+            else
+            {
+                // shield outline with a vertical rib
+                CGContextSetLineWidth(context, 7);
+                CGContextSetLineJoin(context, kCGLineJoinRound);
+                CGContextBeginPath(context);
+                CGContextMoveToPoint(context, 48, 12);
+                CGContextAddLineToPoint(context, 80, 24);
+                CGContextAddCurveToPoint(context, 80, 58, 62, 76, 48, 86);
+                CGContextAddCurveToPoint(context, 34, 76, 16, 58, 16, 24);
+                CGContextClosePath(context);
+                CGContextStrokePath(context);
+                CGContextSetLineWidth(context, 5);
+                CGContextBeginPath(context);
+                CGContextMoveToPoint(context, 48, 24);
+                CGContextAddLineToPoint(context, 48, 72);
+                CGContextStrokePath(context);
+            }
+        }];
+    }
 }
 
 @interface OMWTouchOverlay ()
@@ -257,6 +364,11 @@ namespace
     CGPoint _lookDelta; // finger movement since the last frame
     CGPoint _lookSmooth; // points per second, smoothed over a few frames
     CADisplayLink* _link;
+    UIButton* _keyboardButton; // shown only while the on-screen keyboard is up, to hide it
+    UITouch* _guiTouch; // the finger that taps, drags or scrolls a menu
+    CGPoint _guiStart, _guiLast;
+    int _guiMode; // 0 = not decided yet (tap), 1 = scroll, 2 = drag
+    CGFloat _scrollAccum;
 }
 @end
 
@@ -285,17 +397,18 @@ namespace
 
         // Layout of the buttons (distances in points at scale 1; edit here to move them). The right thumb also looks
         // around: any spot that is not a button is look area.
-        // Format: icon, controller element, corner, dx, dy, radius.
+        // Format: icon, controller element, corner, dx, dy, radius. The right-hand cluster is kept tight against the
+        // screen edge so the rest of the right side stays free for looking around.
         const TouchButton specs[] = {
-            { @"burst.fill", GCInputRightTrigger, BottomRight, 78, 88, 46 }, // attack
-            { @"hand.tap.fill", GCInputButtonA, BottomRight, 178, 56, 34 }, // action
-            { @"arrow.up", GCInputLeftTrigger, BottomRight, 58, 194, 34 }, // jump
-            { @"bag.fill", GCInputButtonB, BottomRight, 172, 150, 28 }, // inventory
-            { @"shield.fill", GCInputButtonX, BottomRight, 262, 100, 28 }, // weapon
-            { @"sparkles", GCInputButtonY, BottomRight, 250, 196, 28 }, // magic
-            { @"line.3.horizontal", GCInputButtonMenu, TopRight, 38, 38, 24 }, // menu
-            { @"book.fill", GCInputLeftShoulder, TopRight, 100, 38, 24 }, // journal
-            { @"eye.slash.fill", GCInputLeftThumbstickButton, TopLeft, 44, 38, 26 }, // sneak
+            { @"custom.swords", GCInputRightTrigger, BottomRight, 52, 78, 34 }, // attack
+            { @"arrow.up", GCInputLeftTrigger, BottomRight, 30, 158, 22 }, // jump
+            { @"hand.raised.fill", GCInputButtonA, BottomRight, 120, 48, 22 }, // action
+            { @"custom.shield", GCInputButtonX, BottomRight, 124, 100, 20 }, // weapon
+            { @"wand.and.stars", GCInputButtonY, BottomRight, 92, 140, 22 }, // magic
+            { @"line.3.horizontal", @"key:escape", TopRight, 30, 30, 22 }, // game menu (save, options)
+            { @"backpack.fill", GCInputButtonB, TopRight, 84, 30, 22 }, // inventory
+            { @"book.fill", GCInputLeftShoulder, TopLeft, 30, 30, 22 }, // journal
+            { @"eye.slash.fill", GCInputLeftThumbstickButton, TopLeft, 84, 30, 22 }, // sneak
         };
         UIImageSymbolConfiguration* symbolConfiguration =
             [UIImageSymbolConfiguration configurationWithPointSize:48 weight:UIImageSymbolWeightMedium];
@@ -308,13 +421,40 @@ namespace
             button.iconLayer = [CALayer layer];
             button.iconLayer.contentsGravity = kCAGravityResizeAspect;
             button.iconLayer.opacity = 0.6;
-            UIImage* image = [UIImage systemImageNamed:button.icon withConfiguration:symbolConfiguration];
-            image = [image imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal];
+            UIImage* image = nil;
+            if ([button.icon hasPrefix:@"custom."])
+                image = drawnIcon(button.icon);
+            else
+            {
+                image = [UIImage systemImageNamed:button.icon withConfiguration:symbolConfiguration];
+                if (image == nil) // symbol missing on this iOS: a plain fallback instead of an invisible button
+                    image = [UIImage systemImageNamed:@"circle.fill" withConfiguration:symbolConfiguration];
+                image = [image imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal];
+            }
             button.iconLayer.contents = (id)image.CGImage;
             [self.layer addSublayer:button.iconLayer];
             _buttons.push_back(button);
             [self styleButton:_buttons.back() pressed:NO];
         }
+
+        // a way to hide the on-screen keyboard, which iOS otherwise leaves up after a tap on a text field
+        _keyboardButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        [_keyboardButton setImage:[UIImage systemImageNamed:@"keyboard.chevron.compact.down"]
+                         forState:UIControlStateNormal];
+        _keyboardButton.tintColor = [UIColor colorWithWhite:1 alpha:0.9];
+        _keyboardButton.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+        _keyboardButton.layer.cornerRadius = 24;
+        _keyboardButton.hidden = YES;
+        [_keyboardButton addTarget:self action:@selector(hideKeyboard) forControlEvents:UIControlEventTouchUpInside];
+        [self addSubview:_keyboardButton];
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(keyboardChanged:)
+                                                   name:UIKeyboardWillShowNotification
+                                                 object:nil];
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(keyboardChanged:)
+                                                   name:UIKeyboardWillHideNotification
+                                                 object:nil];
 
         _link = [[CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)] retain];
         [_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
@@ -328,18 +468,22 @@ namespace
     [super dealloc];
 }
 
-// While a menu or dialog is open, touches that are not on a button go through to the game window underneath, where
-// SDL turns them into ordinary clicks. Buttons stay usable.
-- (UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event
+- (void)keyboardChanged:(NSNotification*)notification
 {
-    if (guiOpen() && [self buttonAt:point] == nullptr)
-        return nil;
-    return [super hitTest:point withEvent:event];
+    _keyboardButton.hidden = [notification.name isEqualToString:UIKeyboardWillHideNotification];
+}
+
+- (void)hideKeyboard
+{
+    SDL_StopTextInput();
+    [sWindow endEditing:YES];
+    _keyboardButton.hidden = YES;
 }
 
 // stops the display link (it retains this view) and lets go of every control
 - (void)teardown
 {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
     [_link invalidate];
     [_link release];
     _link = nil;
@@ -348,12 +492,13 @@ namespace
         [_controller setPosition:CGPointZero forDirectionPadElement:GCInputLeftThumbstick];
         [_controller setPosition:CGPointZero forDirectionPadElement:GCInputRightThumbstick];
         for (TouchButton& button : _buttons)
-            if (button.touch != nil)
+            if (button.touch != nil && !isKeyButton(button.element))
                 [_controller setValue:0 forButtonElement:button.element];
     }
     _controller = nil;
     _stickTouch = nil;
     _lookTouch = nil;
+    _guiTouch = nil;
 }
 
 - (void)safeAreaInsetsDidChange
@@ -374,6 +519,7 @@ namespace
     const CGFloat top = inset.top;
     const CGFloat bottom = size.height - inset.bottom;
     _stickRest = CGPointMake(left + 120 * _scale, bottom - 96 * _scale);
+    _keyboardButton.frame = CGRectMake(size.width / 2 - 24, top + 10, 48, 48);
     const CGFloat screenScale = self.traitCollection.displayScale;
 
     [CATransaction begin];
@@ -398,7 +544,7 @@ namespace
         button.scaledRadius = radius;
         button.circle.frame = CGRectMake(button.center.x - radius, button.center.y - radius, 2 * radius, 2 * radius);
         button.circle.path = [UIBezierPath bezierPathWithOvalInRect:button.circle.bounds].CGPath;
-        const CGFloat side = radius * 1.0;
+        const CGFloat side = radius * 1.1;
         button.iconLayer.contentsScale = screenScale;
         button.iconLayer.frame = CGRectMake(button.center.x - side / 2, button.center.y - side / 2, side, side);
     }
@@ -483,7 +629,10 @@ namespace
 {
     button.touch = touch;
     button.pressedAt = CACurrentMediaTime();
-    [_controller setValue:1 forButtonElement:button.element];
+    if (isKeyButton(button.element))
+        pushKey(SDL_SCANCODE_ESCAPE, true);
+    else
+        [_controller setValue:1 forButtonElement:button.element];
     [self styleButton:button pressed:YES];
 }
 
@@ -492,6 +641,11 @@ namespace
 {
     button.touch = nil;
     [self styleButton:button pressed:NO];
+    if (isKeyButton(button.element))
+    {
+        pushKey(SDL_SCANCODE_ESCAPE, false);
+        return;
+    }
     const CFTimeInterval held = CACurrentMediaTime() - button.pressedAt;
     if (held >= 0.1)
     {
@@ -518,6 +672,18 @@ namespace
         {
             if (button->touch == nil)
                 [self press:*button touch:touch];
+        }
+        else if (guiOpen())
+        {
+            // a menu is open: this finger works the menu (tap = click, vertical swipe = scroll, sideways = drag)
+            if (_guiTouch == nil)
+            {
+                _guiTouch = touch;
+                _guiStart = _guiLast = point;
+                _guiMode = 0;
+                _scrollAccum = 0;
+                pushMouseMotion(point, point, false);
+            }
         }
         else if (point.x < self.bounds.size.width * walkZoneWidth)
         {
@@ -557,6 +723,44 @@ namespace
             _stickOffset = CGPointMake(dx, dy);
             [self sendStick];
         }
+        else if (touch == _guiTouch)
+        {
+            if (_guiMode == 0)
+            {
+                const CGFloat dx = point.x - _guiStart.x;
+                const CGFloat dy = point.y - _guiStart.y;
+                if (std::hypot(dx, dy) < 10 * _scale)
+                    continue;
+                if (std::fabs(dy) > std::fabs(dx) * 1.2)
+                {
+                    _guiMode = 1;
+                    _guiLast = point;
+                    _scrollAccum = 0;
+                }
+                else
+                {
+                    _guiMode = 2;
+                    pushMouseButton(_guiStart, true);
+                }
+            }
+            if (_guiMode == 1)
+            {
+                // finger up = content up = wheel down
+                _scrollAccum += point.y - _guiLast.y;
+                _guiLast = point;
+                const int steps = static_cast<int>(_scrollAccum / 16);
+                if (steps != 0)
+                {
+                    pushMouseWheel(steps);
+                    _scrollAccum -= steps * 16;
+                }
+            }
+            else
+            {
+                pushMouseMotion(point, _guiLast, true);
+                _guiLast = point;
+            }
+        }
         else if (touch == _lookTouch)
         {
             _lookDelta.x += point.x - _lookLast.x;
@@ -575,6 +779,20 @@ namespace
             _stickTouch = nil;
             _stickOffset = CGPointZero;
             [self sendStick];
+        }
+        else if (touch == _guiTouch)
+        {
+            _guiTouch = nil;
+            if (_guiMode == 0)
+            {
+                // a tap: press now, release a moment later so the engine sees a click
+                const CGPoint at = _guiStart;
+                pushMouseButton(at, true);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, static_cast<int64_t>(0.06 * NSEC_PER_SEC)),
+                    dispatch_get_main_queue(), ^{ pushMouseButton(at, false); });
+            }
+            else if (_guiMode == 2)
+                pushMouseButton(_guiLast, false);
         }
         else if (touch == _lookTouch)
         {
