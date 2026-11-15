@@ -51,6 +51,13 @@ namespace
     // memory log while the app runs: a long session's trend
     dispatch_source_t sMemoryTimer = nil;
 
+    // What the controls panel saves (NSUserDefaults).
+    NSString* const kLookGainKey = @"omw.lookGain";
+    NSString* const kOpacityKey = @"omw.buttonOpacity";
+    NSString* const kButtonScaleKey = @"omw.buttonScale";
+    NSString* const kGuiScaleKey = @"omw.guiScale";
+    NSString* const kLayoutKey = @"omw.layout";
+
     // footprint = what iOS counts against the app's memory limit; footprint + available = that limit
     void logMemory(const char* when)
     {
@@ -274,9 +281,12 @@ namespace
 
 namespace
 {
-    // Camera speed: how much of the finger's movement the camera follows. Higher = faster turning. On top of it
-    // the engine's own setting applies (Options > Controls > Camera sensitivity, 0.2 to 5).
-    constexpr CGFloat lookGain = 1.8;
+    // Defaults and limits of what the controls panel changes. Camera speed = how much of the finger's movement the
+    // camera follows (higher = faster turning); the engine's own Camera sensitivity multiplies it, leave that at 1.
+    constexpr CGFloat defaultLookGain = 3.0, minLookGain = 0.5, maxLookGain = 10;
+    constexpr CGFloat defaultOpacity = 0.75, minOpacity = 0.15, maxOpacity = 1;
+    constexpr CGFloat defaultButtonScale = 1, minButtonScale = 0.6, maxButtonScale = 1.6;
+    constexpr CGFloat minGuiScale = 0.5, maxGuiScale = 1.5;
     // The walking stick: the finger's distance from where it touched down for full deflection (points at scale 1).
     constexpr CGFloat stickRadiusBase = 64;
     // Touches left of this fraction of the screen width walk, the rest look.
@@ -300,7 +310,8 @@ namespace
         UITouch* touch = nil; // the finger holding it, not retained
         CFTimeInterval pressedAt = 0;
         CAShapeLayer* circle = nil; // owned by the overlay's layer
-        CALayer* iconLayer = nil;
+        CALayer* iconLayer = nil; // plain white, shaped by its mask: every icon has the same colour
+        CGFloat dx0 = 0, dy0 = 0; // the default position, for "reset"
     };
 
     CGFloat clampUnit(CGFloat value)
@@ -362,6 +373,54 @@ namespace
             }
         }];
     }
+
+    CGFloat savedValue(NSString* key, CGFloat fallback, CGFloat low, CGFloat high)
+    {
+        id stored = [NSUserDefaults.standardUserDefaults objectForKey:key];
+        if (![stored isKindOfClass:NSNumber.class])
+            return fallback;
+        return std::max(low, std::min(high, static_cast<CGFloat>([stored doubleValue])));
+    }
+
+    void saveValue(NSString* key, CGFloat value)
+    {
+        [NSUserDefaults.standardUserDefaults setDouble:value forKey:key];
+    }
+
+    // buttons that are not game controls: the settings gear
+    bool isUiButton(NSString* element)
+    {
+        return [element isEqualToString:@"ui:settings"];
+    }
+
+    // buttons that stay while a menu is open
+    bool staysInMenus(NSString* element)
+    {
+        return isKeyButton(element) || isUiButton(element);
+    }
+
+    // The picture of an icon as an alpha mask. SF Symbols are drawn into a bitmap first, so every icon ends up the same
+    // plain white however iOS would tint the symbol.
+    UIImage* iconMask(NSString* icon)
+    {
+        if ([icon hasPrefix:@"custom."])
+            return drawnIcon(icon);
+        UIImageSymbolConfiguration* configuration =
+            [UIImageSymbolConfiguration configurationWithPointSize:64 weight:UIImageSymbolWeightMedium];
+        UIImage* symbol = [UIImage systemImageNamed:icon withConfiguration:configuration];
+        if (symbol == nil) // missing on this iOS: a plain disc instead of an invisible button
+            symbol = [UIImage systemImageNamed:@"circle.fill" withConfiguration:configuration];
+        UIGraphicsImageRendererFormat* format = [UIGraphicsImageRendererFormat preferredFormat];
+        format.opaque = NO;
+        UIGraphicsImageRenderer* renderer =
+            [[[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(96, 96) format:format] autorelease];
+        return [renderer imageWithActions:^(UIGraphicsImageRendererContext*) {
+            const CGSize size = symbol.size;
+            const CGFloat fit = std::min<CGFloat>(1, std::min(84 / size.width, 84 / size.height));
+            const CGSize drawn = CGSizeMake(size.width * fit, size.height * fit);
+            [symbol drawInRect:CGRectMake((96 - drawn.width) / 2, (96 - drawn.height) / 2, drawn.width, drawn.height)];
+        }];
+    }
 }
 
 @interface OMWTouchOverlay ()
@@ -375,7 +434,7 @@ namespace
     CGPoint _stickRest; // where the stick waits when nobody walks
     CGPoint _stickOffset; // finger offset from the centre, clamped to the stick radius
     CGFloat _stickRadius;
-    CGFloat _scale;
+    CGFloat _scale; // from the screen size
     UITouch* _lookTouch;
     CGPoint _lookLast;
     CGPoint _lookAcc; // fractional camera movement carried to the next event
@@ -386,6 +445,31 @@ namespace
     CGPoint _guiStart, _guiLast;
     int _guiMode; // 0 = not decided yet (tap), 1 = scroll, 2 = drag
     CGFloat _scrollAccum;
+
+    // what the panel changes (saved in NSUserDefaults)
+    CGFloat _lookGain;
+    CGFloat _opacity;
+    CGFloat _buttonScale;
+    CGFloat _guiScale;
+
+    // the panel and the layout editor; the views belong to their superviews
+    UIControl* _backdrop;
+    UIControl* _panel;
+    UIScrollView* _scroll;
+    UILabel* _panelTitle;
+    UIButton* _panelClose;
+    UILabel* _labels[4];
+    UISlider* _sliders[4];
+    UIButton* _editButton;
+    UIButton* _resetButton;
+    UIControl* _editBar;
+    UILabel* _editHint;
+    UIButton* _editDone;
+    UIButton* _editReset;
+    BOOL _editMode;
+    NSInteger _dragIndex;
+    UITouch* _dragTouch;
+    CGPoint _dragOffset;
 }
 @end
 
@@ -397,25 +481,30 @@ namespace
     {
         _controller = controller;
         _scale = 1;
+        _dragIndex = -1;
+        _lookGain = savedValue(kLookGainKey, defaultLookGain, minLookGain, maxLookGain);
+        _opacity = savedValue(kOpacityKey, defaultOpacity, minOpacity, maxOpacity);
+        _buttonScale = savedValue(kButtonScaleKey, defaultButtonScale, minButtonScale, maxButtonScale);
+        _guiScale = savedValue(kGuiScaleKey, Settings::gui().mScalingFactor.get(), minGuiScale, maxGuiScale);
         self.multipleTouchEnabled = YES;
         self.backgroundColor = UIColor.clearColor;
         self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 
         _stickBase = [CAShapeLayer layer];
-        _stickBase.fillColor = [UIColor colorWithWhite:1 alpha:0.03].CGColor;
-        _stickBase.strokeColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
+        _stickBase.fillColor = [UIColor colorWithWhite:1 alpha:0.06].CGColor;
+        _stickBase.strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
         _stickBase.lineWidth = 1.5;
         [self.layer addSublayer:_stickBase];
         _stickKnob = [CAShapeLayer layer];
-        _stickKnob.fillColor = [UIColor colorWithWhite:1 alpha:0.14].CGColor;
-        _stickKnob.strokeColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
+        _stickKnob.fillColor = [UIColor colorWithWhite:1 alpha:0.20].CGColor;
+        _stickKnob.strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
         _stickKnob.lineWidth = 1.5;
         [self.layer addSublayer:_stickKnob];
 
-        // Layout of the buttons (distances in points at scale 1; edit here to move them). The right thumb also looks
-        // around: any spot that is not a button is look area.
-        // Format: icon, controller element, corner, dx, dy, radius. The right-hand cluster is kept tight against the
-        // screen edge so the rest of the right side stays free for looking around.
+        // Default layout of the buttons (distances in points at scale 1). The player moves them in the controls panel
+        // (gear button > Расположить кнопки); the right thumb also looks around: any spot that is not a button is
+        // look area.
+        // Format: icon, controller element, corner, dx, dy, radius.
         const TouchButton specs[] = {
             { @"custom.swords", GCInputRightTrigger, BottomRight, 52, 78, 34 }, // attack
             { @"arrow.up", GCInputLeftTrigger, BottomRight, 30, 158, 22 }, // jump
@@ -424,35 +513,28 @@ namespace
             { @"wand.and.stars", GCInputButtonY, BottomRight, 92, 140, 22 }, // magic
             { @"line.3.horizontal", @"key:escape", TopRight, 30, 30, 22 }, // game menu (save, options)
             { @"backpack.fill", GCInputButtonB, TopRight, 84, 30, 22 }, // inventory
+            { @"gearshape.fill", @"ui:settings", TopRight, 138, 30, 22 }, // controls panel
             { @"book.fill", GCInputLeftShoulder, TopLeft, 30, 30, 22 }, // journal
             { @"eye.slash.fill", GCInputLeftThumbstickButton, TopLeft, 84, 30, 22 }, // sneak
         };
-        UIImageSymbolConfiguration* symbolConfiguration =
-            [UIImageSymbolConfiguration configurationWithPointSize:48 weight:UIImageSymbolWeightMedium];
         for (TouchButton button : specs)
         {
+            button.dx0 = button.dx;
+            button.dy0 = button.dy;
             button.circle = [CAShapeLayer layer];
             button.circle.lineWidth = 1.5;
-            button.circle.strokeColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
+            button.circle.strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
             [self.layer addSublayer:button.circle];
             button.iconLayer = [CALayer layer];
-            button.iconLayer.contentsGravity = kCAGravityResizeAspect;
-            button.iconLayer.opacity = 0.6;
-            UIImage* image = nil;
-            if ([button.icon hasPrefix:@"custom."])
-                image = drawnIcon(button.icon);
-            else
-            {
-                image = [UIImage systemImageNamed:button.icon withConfiguration:symbolConfiguration];
-                if (image == nil) // symbol missing on this iOS: a plain fallback instead of an invisible button
-                    image = [UIImage systemImageNamed:@"circle.fill" withConfiguration:symbolConfiguration];
-                image = [image imageWithTintColor:UIColor.whiteColor renderingMode:UIImageRenderingModeAlwaysOriginal];
-            }
-            button.iconLayer.contents = (id)image.CGImage;
+            button.iconLayer.backgroundColor = UIColor.whiteColor.CGColor;
+            CALayer* mask = [CALayer layer];
+            mask.contentsGravity = kCAGravityResizeAspect;
+            mask.contents = (id)iconMask(button.icon).CGImage;
+            button.iconLayer.mask = mask;
             [self.layer addSublayer:button.iconLayer];
             _buttons.push_back(button);
-            [self styleButton:_buttons.back() pressed:NO];
         }
+        [self loadLayout];
 
         // a way to hide the on-screen keyboard, which iOS otherwise leaves up after a tap on a text field
         _keyboardButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -473,6 +555,10 @@ namespace
                                                    name:UIKeyboardWillHideNotification
                                                  object:nil];
 
+        [self buildPanel];
+        [self buildEditBar];
+        [self applyStyle];
+
         _link = [[CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)] retain];
         [_link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     }
@@ -484,6 +570,275 @@ namespace
     [self teardown];
     [super dealloc];
 }
+
+// ---- saved layout ------------------------------------------------------------------------------------------------
+
+- (void)loadLayout
+{
+    NSDictionary* saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:kLayoutKey];
+    for (TouchButton& button : _buttons)
+    {
+        NSArray* position = saved[button.element];
+        if ([position isKindOfClass:NSArray.class] && position.count == 2)
+        {
+            button.dx = [position[0] doubleValue];
+            button.dy = [position[1] doubleValue];
+        }
+    }
+}
+
+- (void)saveLayout
+{
+    NSMutableDictionary* layout = [NSMutableDictionary dictionary];
+    for (TouchButton& button : _buttons)
+        layout[button.element] = @[ @(button.dx), @(button.dy) ];
+    [NSUserDefaults.standardUserDefaults setObject:layout forKey:kLayoutKey];
+}
+
+// ---- the controls panel ------------------------------------------------------------------------------------------
+
+- (UIButton*)panelButton:(NSString*)title action:(SEL)action parent:(UIView*)parent
+{
+    UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
+    [button setTitle:title forState:UIControlStateNormal];
+    [button setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    button.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    button.titleLabel.adjustsFontSizeToFitWidth = YES;
+    button.titleLabel.minimumScaleFactor = 0.7;
+    button.backgroundColor = [UIColor colorWithWhite:1 alpha:0.16];
+    button.layer.cornerRadius = 9;
+    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [parent addSubview:button];
+    return button;
+}
+
+- (void)buildPanel
+{
+    // a tap outside the panel closes it; the dim layer also keeps those taps away from the game
+    _backdrop = [[UIControl alloc] init];
+    _backdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45];
+    _backdrop.hidden = YES;
+    [_backdrop addTarget:self action:@selector(closePanel) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:_backdrop];
+    [_backdrop release];
+
+    // a UIControl, so a tap on the panel's empty parts does not reach the backdrop
+    _panel = [[UIControl alloc] init];
+    _panel.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.09 alpha:0.97];
+    _panel.layer.cornerRadius = 14;
+    _panel.layer.masksToBounds = YES;
+    [_backdrop addSubview:_panel];
+    [_panel release];
+
+    _panelTitle = [[UILabel alloc] init];
+    _panelTitle.text = @"Настройки управления";
+    _panelTitle.textColor = UIColor.whiteColor;
+    _panelTitle.font = [UIFont systemFontOfSize:16 weight:UIFontWeightBold];
+    [_panel addSubview:_panelTitle];
+    [_panelTitle release];
+    _panelClose = [self panelButton:@"Закрыть" action:@selector(closePanel) parent:_panel];
+
+    _scroll = [[UIScrollView alloc] init];
+    _scroll.alwaysBounceVertical = YES;
+    [_panel addSubview:_scroll];
+    [_scroll release];
+
+    const CGFloat lows[4] = { minLookGain, minOpacity, minButtonScale, minGuiScale };
+    const CGFloat highs[4] = { maxLookGain, maxOpacity, maxButtonScale, maxGuiScale };
+    for (int i = 0; i < 4; ++i)
+    {
+        UILabel* label = [[UILabel alloc] init];
+        label.textColor = UIColor.whiteColor;
+        label.font = [UIFont systemFontOfSize:13];
+        label.numberOfLines = 2;
+        [_scroll addSubview:label];
+        _labels[i] = label;
+        [label release];
+
+        UISlider* slider = [[UISlider alloc] init];
+        slider.tag = i;
+        slider.minimumValue = static_cast<float>(lows[i]);
+        slider.maximumValue = static_cast<float>(highs[i]);
+        slider.minimumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.9];
+        slider.maximumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.25];
+        slider.thumbTintColor = UIColor.whiteColor;
+        [slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
+        [_scroll addSubview:slider];
+        _sliders[i] = slider;
+        [slider release];
+    }
+    _editButton = [self panelButton:@"Расположить кнопки" action:@selector(beginEdit) parent:_scroll];
+    _resetButton = [self panelButton:@"Сбросить настройки" action:@selector(resetSettings) parent:_scroll];
+    [self syncSliders];
+    [self updateLabels];
+}
+
+- (void)buildEditBar
+{
+    _editBar = [[UIControl alloc] init];
+    _editBar.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.09 alpha:0.92];
+    _editBar.layer.cornerRadius = 12;
+    _editBar.hidden = YES;
+    [self addSubview:_editBar];
+    [_editBar release];
+
+    _editHint = [[UILabel alloc] init];
+    _editHint.text = @"Перетащи кнопки куда удобно";
+    _editHint.textColor = UIColor.whiteColor;
+    _editHint.font = [UIFont systemFontOfSize:12];
+    _editHint.numberOfLines = 2;
+    [_editBar addSubview:_editHint];
+    [_editHint release];
+    _editDone = [self panelButton:@"Готово" action:@selector(endEdit) parent:_editBar];
+    _editReset = [self panelButton:@"Сбросить" action:@selector(resetLayout) parent:_editBar];
+}
+
+- (void)syncSliders
+{
+    _sliders[0].value = static_cast<float>(_lookGain);
+    _sliders[1].value = static_cast<float>(_opacity);
+    _sliders[2].value = static_cast<float>(_buttonScale);
+    _sliders[3].value = static_cast<float>(_guiScale);
+}
+
+- (void)updateLabels
+{
+    _labels[0].text = [NSString stringWithFormat:@"Чувствительность камеры: %.1f", _lookGain];
+    _labels[1].text = [NSString stringWithFormat:@"Прозрачность кнопок: %d%%", static_cast<int>(std::lround(_opacity * 100))];
+    _labels[2].text = [NSString stringWithFormat:@"Размер кнопок: %d%%", static_cast<int>(std::lround(_buttonScale * 100))];
+    _labels[3].text = [NSString
+        stringWithFormat:@"Размер меню игры: %.2f (применится после перезапуска игры)", _guiScale];
+}
+
+- (void)sliderChanged:(UISlider*)slider
+{
+    const CGFloat value = slider.value;
+    switch (slider.tag)
+    {
+        case 0:
+            _lookGain = value;
+            saveValue(kLookGainKey, value);
+            break;
+        case 1:
+            _opacity = value;
+            saveValue(kOpacityKey, value);
+            [self applyStyle];
+            break;
+        case 2:
+            _buttonScale = value;
+            saveValue(kButtonScaleKey, value);
+            [self setNeedsLayout];
+            break;
+        default:
+            // steps of 0.05; the interface reads its scale once at launch (configureMetalHud)
+            _guiScale = std::round(value * 20) / 20;
+            saveValue(kGuiScaleKey, _guiScale);
+            break;
+    }
+    [self updateLabels];
+}
+
+- (void)openSettings
+{
+    [self syncSliders];
+    [self updateLabels];
+    _backdrop.hidden = NO;
+    [self bringSubviewToFront:_backdrop];
+}
+
+- (void)closePanel
+{
+    _backdrop.hidden = YES;
+}
+
+- (void)resetSettings
+{
+    NSUserDefaults* defaults = NSUserDefaults.standardUserDefaults;
+    for (NSString* key in @[ kLookGainKey, kOpacityKey, kButtonScaleKey, kLayoutKey ])
+        [defaults removeObjectForKey:key];
+    _lookGain = defaultLookGain;
+    _opacity = defaultOpacity;
+    _buttonScale = defaultButtonScale;
+    _guiScale = 1;
+    saveValue(kGuiScaleKey, _guiScale);
+    for (TouchButton& button : _buttons)
+    {
+        button.dx = button.dx0;
+        button.dy = button.dy0;
+    }
+    [self syncSliders];
+    [self updateLabels];
+    [self applyStyle];
+    [self setNeedsLayout];
+}
+
+// ---- moving the buttons ------------------------------------------------------------------------------------------
+
+- (void)beginEdit
+{
+    _backdrop.hidden = YES;
+    [self releaseControls];
+    _editMode = YES;
+    _editBar.hidden = NO;
+    [self bringSubviewToFront:_editBar];
+    [self updateVisibility];
+    [self applyStyle];
+}
+
+- (void)endEdit
+{
+    _editMode = NO;
+    _editBar.hidden = YES;
+    _dragTouch = nil;
+    _dragIndex = -1;
+    [self saveLayout];
+    [self updateVisibility];
+    [self applyStyle];
+}
+
+- (void)resetLayout
+{
+    for (TouchButton& button : _buttons)
+    {
+        button.dx = button.dx0;
+        button.dy = button.dy0;
+    }
+    [self saveLayout];
+    [self setNeedsLayout];
+}
+
+- (void)dragButtonTo:(CGPoint)point
+{
+    TouchButton& button = _buttons[_dragIndex];
+    const UIEdgeInsets inset = self.safeAreaInsets;
+    const CGSize size = self.bounds.size;
+    const CGFloat left = inset.left;
+    const CGFloat right = size.width - inset.right;
+    const CGFloat top = inset.top;
+    const CGFloat bottom = size.height - inset.bottom;
+    const CGFloat radius = button.scaledRadius;
+    const CGFloat x = std::max<CGFloat>(left + radius, std::min<CGFloat>(right - radius, point.x - _dragOffset.x));
+    const CGFloat y = std::max<CGFloat>(top + radius, std::min<CGFloat>(bottom - radius, point.y - _dragOffset.y));
+    switch (button.anchor)
+    {
+        case BottomRight:
+            button.dx = (right - x) / _scale;
+            button.dy = (bottom - y) / _scale;
+            break;
+        case TopRight:
+            button.dx = (right - x) / _scale;
+            button.dy = (y - top) / _scale;
+            break;
+        case TopLeft:
+            button.dx = (x - left) / _scale;
+            button.dy = (y - top) / _scale;
+            break;
+    }
+    [self setNeedsLayout];
+    [self layoutIfNeeded];
+}
+
+// ---- keyboard ----------------------------------------------------------------------------------------------------
 
 - (void)keyboardChanged:(NSNotification*)notification
 {
@@ -509,14 +864,17 @@ namespace
         [_controller setPosition:CGPointZero forDirectionPadElement:GCInputLeftThumbstick];
         [_controller setPosition:CGPointZero forDirectionPadElement:GCInputRightThumbstick];
         for (TouchButton& button : _buttons)
-            if (button.touch != nil && !isKeyButton(button.element))
+            if (button.touch != nil && !staysInMenus(button.element))
                 [_controller setValue:0 forButtonElement:button.element];
     }
     _controller = nil;
     _stickTouch = nil;
     _lookTouch = nil;
     _guiTouch = nil;
+    _dragTouch = nil;
 }
+
+// ---- layout and looks --------------------------------------------------------------------------------------------
 
 - (void)safeAreaInsetsDidChange
 {
@@ -557,25 +915,65 @@ namespace
                 button.center = CGPointMake(left + dx, top + dy);
                 break;
         }
-        const CGFloat radius = button.radius * _scale;
+        const CGFloat radius = button.radius * _scale * _buttonScale;
         button.scaledRadius = radius;
         button.circle.frame = CGRectMake(button.center.x - radius, button.center.y - radius, 2 * radius, 2 * radius);
         button.circle.path = [UIBezierPath bezierPathWithOvalInRect:button.circle.bounds].CGPath;
         const CGFloat side = radius * 1.1;
         button.iconLayer.contentsScale = screenScale;
         button.iconLayer.frame = CGRectMake(button.center.x - side / 2, button.center.y - side / 2, side, side);
+        button.iconLayer.mask.frame = button.iconLayer.bounds;
+        button.iconLayer.mask.contentsScale = screenScale;
     }
     [self updateStickLayers];
     [CATransaction commit];
+
+    // panel, backdrop and the layout editor's bar
+    _backdrop.frame = self.bounds;
+    const CGFloat width = std::min<CGFloat>(480, size.width - inset.left - inset.right - 40);
+    const CGFloat height = std::min<CGFloat>(340, size.height - inset.top - inset.bottom - 20);
+    _panel.frame = CGRectMake((size.width - width) / 2, (size.height - height) / 2, width, height);
+    _panelTitle.frame = CGRectMake(16, 8, width - 110, 32);
+    _panelClose.frame = CGRectMake(width - 94, 8, 82, 32);
+    _scroll.frame = CGRectMake(0, 44, width, height - 44);
+    const CGFloat rowHeight = 72;
+    for (int i = 0; i < 4; ++i)
+    {
+        _labels[i].frame = CGRectMake(16, 4 + i * rowHeight, width - 32, 34);
+        _sliders[i].frame = CGRectMake(16, 40 + i * rowHeight, width - 32, 28);
+    }
+    const CGFloat buttonsY = 4 + 4 * rowHeight + 4;
+    const CGFloat half = (width - 44) / 2;
+    _editButton.frame = CGRectMake(16, buttonsY, half, 40);
+    _resetButton.frame = CGRectMake(28 + half, buttonsY, half, 40);
+    _scroll.contentSize = CGSizeMake(width, buttonsY + 40 + 16);
+    const CGFloat barWidth = std::min<CGFloat>(400, size.width - 20);
+    _editBar.frame = CGRectMake((size.width - barWidth) / 2, top + 6, barWidth, 48);
+    _editHint.frame = CGRectMake(12, 4, barWidth - 214, 40);
+    _editDone.frame = CGRectMake(barWidth - 194, 8, 90, 32);
+    _editReset.frame = CGRectMake(barWidth - 98, 8, 90, 32);
 }
 
+// Every button has the same look: a white ring and icon at the chosen opacity; pressed ones are brighter. While the
+// layout is edited all buttons are drawn clearly, even at a low opacity.
 - (void)styleButton:(TouchButton&)button pressed:(BOOL)pressed
 {
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    button.circle.fillColor = [UIColor colorWithWhite:1 alpha:pressed ? 0.30 : 0.05].CGColor;
-    button.iconLayer.opacity = pressed ? 0.95 : 0.6;
+    CGFloat opacity = pressed ? std::min<CGFloat>(1, _opacity + 0.25) : _opacity;
+    if (_editMode)
+        opacity = std::max<CGFloat>(opacity, 0.7);
+    button.circle.fillColor = [UIColor colorWithWhite:1 alpha:pressed ? 0.40 : 0.10].CGColor;
+    button.circle.opacity = static_cast<float>(opacity);
+    button.iconLayer.opacity = static_cast<float>(opacity);
     [CATransaction commit];
+}
+
+- (void)applyStyle
+{
+    for (TouchButton& button : _buttons)
+        [self styleButton:button pressed:button.touch != nil];
+    [self updateStickLayers];
 }
 
 - (void)updateStickLayers
@@ -587,12 +985,13 @@ namespace
     _stickKnob.hidden = _guiActive;
     const CGPoint center = active ? _stickCenter : _stickRest;
     const CGFloat radius = _stickRadius;
-    _stickBase.opacity = active ? 1 : 0.6;
+    const float opacity = static_cast<float>(_opacity * (active ? 1 : 0.7));
+    _stickBase.opacity = opacity;
     _stickBase.frame = CGRectMake(center.x - radius, center.y - radius, 2 * radius, 2 * radius);
     _stickBase.path = [UIBezierPath bezierPathWithOvalInRect:_stickBase.bounds].CGPath;
     const CGFloat knob = radius * 0.42;
     const CGPoint knobCenter = CGPointMake(center.x + _stickOffset.x, center.y + _stickOffset.y);
-    _stickKnob.opacity = active ? 1 : 0.6;
+    _stickKnob.opacity = opacity;
     _stickKnob.frame = CGRectMake(knobCenter.x - knob, knobCenter.y - knob, 2 * knob, 2 * knob);
     _stickKnob.path = [UIBezierPath bezierPathWithOvalInRect:_stickKnob.bounds].CGPath;
     [CATransaction commit];
@@ -608,7 +1007,10 @@ namespace
     [self updateStickLayers];
 }
 
-// the game buttons and the stick only exist while the game is played; in a menu or a dialog only the menu button stays
+// ---- game or menu ------------------------------------------------------------------------------------------------
+
+// the game buttons and the stick only exist while the game is played; in a menu or a dialog only the menu button and
+// the gear stay
 - (void)tick:(CADisplayLink*)link
 {
     [self syncGui];
@@ -626,21 +1028,31 @@ namespace
 - (void)setGuiActive:(BOOL)active
 {
     _guiActive = active;
-    // Let go of everything the game was holding. In a menu the engine moves its cursor with the controller's sticks,
-    // so a stick left deflected would drag the cursor away from every tap.
+    [self releaseControls];
+    [self updateVisibility];
+}
+
+// Let go of everything the game was holding. In a menu the engine moves its cursor with the controller's sticks, so a
+// stick left deflected would drag the cursor away from every tap.
+- (void)releaseControls
+{
     _stickTouch = nil;
     _stickOffset = CGPointZero;
     _lookTouch = nil;
     _lookAcc = CGPointZero;
     [_controller setPosition:CGPointZero forDirectionPadElement:GCInputLeftThumbstick];
     [_controller setPosition:CGPointZero forDirectionPadElement:GCInputRightThumbstick];
-    for (TouchButton& button : _buttons)
-        if (button.touch != nil && !isKeyButton(button.element))
-            [self lift:button];
+    for (NSInteger i = 0; i < static_cast<NSInteger>(_buttons.size()); ++i)
+        if (_buttons[i].touch != nil && !staysInMenus(_buttons[i].element))
+            [self liftButton:i];
     if (_guiTouch != nil && _guiMode == 2)
         pushMouseButton(_guiLast, false);
     _guiTouch = nil;
-    [self updateVisibility];
+}
+
+- (BOOL)shown:(const TouchButton&)button
+{
+    return _editMode || !_guiActive || staysInMenus(button.element);
 }
 
 - (void)updateVisibility
@@ -649,7 +1061,7 @@ namespace
     [CATransaction setDisableActions:YES];
     for (TouchButton& button : _buttons)
     {
-        const BOOL hidden = _guiActive && !isKeyButton(button.element);
+        const BOOL hidden = ![self shown:button];
         button.circle.hidden = hidden;
         button.iconLayer.hidden = hidden;
     }
@@ -657,14 +1069,17 @@ namespace
     [self updateStickLayers];
 }
 
-// the button under a point, the nearest one when buttons are close; nullptr for none
-- (TouchButton*)buttonAt:(CGPoint)point
+// ---- buttons -----------------------------------------------------------------------------------------------------
+
+// the shown button under a point, the nearest one when buttons are close; -1 for none
+- (NSInteger)buttonIndexAt:(CGPoint)point
 {
-    TouchButton* best = nullptr;
+    NSInteger best = -1;
     CGFloat bestScore = 1e9;
-    for (TouchButton& button : _buttons)
+    for (NSInteger i = 0; i < static_cast<NSInteger>(_buttons.size()); ++i)
     {
-        if (_guiActive && !isKeyButton(button.element))
+        const TouchButton& button = _buttons[i];
+        if (![self shown:button])
             continue;
         const CGFloat distance = std::hypot(point.x - button.center.x, point.y - button.center.y);
         if (distance > button.scaledRadius + 10 * _scale)
@@ -672,29 +1087,36 @@ namespace
         const CGFloat score = distance / button.scaledRadius;
         if (score < bestScore)
         {
-            best = &button;
+            best = i;
             bestScore = score;
         }
     }
     return best;
 }
 
-- (void)press:(TouchButton&)button touch:(UITouch*)touch
+- (void)pressButton:(NSInteger)index touch:(UITouch*)touch
 {
+    TouchButton& button = _buttons[index];
     button.touch = touch;
     button.pressedAt = CACurrentMediaTime();
     if (isKeyButton(button.element))
         pushKey(SDL_SCANCODE_ESCAPE, true);
-    else
+    else if (!isUiButton(button.element))
         [_controller setValue:1 forButtonElement:button.element];
     [self styleButton:button pressed:YES];
 }
 
 // held for at least 0.1 s: SDL reads the button state once per frame, a shorter tap could be missed
-- (void)lift:(TouchButton&)button
+- (void)liftButton:(NSInteger)index
 {
+    TouchButton& button = _buttons[index];
     button.touch = nil;
     [self styleButton:button pressed:NO];
+    if (isUiButton(button.element))
+    {
+        [self openSettings];
+        return;
+    }
     if (isKeyButton(button.element))
     {
         pushKey(SDL_SCANCODE_ESCAPE, false);
@@ -712,10 +1134,12 @@ namespace
             if (_controller == nil)
                 return;
             for (TouchButton& other : _buttons)
-                if (other.element == element && other.touch == nil)
+                if ([other.element isEqualToString:element] && other.touch == nil)
                     [_controller setValue:0 forButtonElement:element];
         });
 }
+
+// ---- touches -----------------------------------------------------------------------------------------------------
 
 - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 {
@@ -723,10 +1147,22 @@ namespace
     for (UITouch* touch in touches)
     {
         const CGPoint point = [touch locationInView:self];
-        if (TouchButton* button = [self buttonAt:point])
+        const NSInteger index = [self buttonIndexAt:point];
+        if (_editMode)
         {
-            if (button->touch == nil)
-                [self press:*button touch:touch];
+            // moving the buttons: nothing is sent to the game
+            if (index >= 0 && _dragTouch == nil)
+            {
+                _dragTouch = touch;
+                _dragIndex = index;
+                _dragOffset = CGPointMake(point.x - _buttons[index].center.x, point.y - _buttons[index].center.y);
+            }
+            continue;
+        }
+        if (index >= 0)
+        {
+            if (_buttons[index].touch == nil)
+                [self pressButton:index touch:touch];
         }
         else if (_guiActive)
         {
@@ -764,6 +1200,12 @@ namespace
     for (UITouch* touch in touches)
     {
         const CGPoint point = [touch locationInView:self];
+        if (_editMode)
+        {
+            if (touch == _dragTouch && _dragIndex >= 0)
+                [self dragButtonTo:point];
+            continue;
+        }
         if (touch == _stickTouch)
         {
             CGFloat dx = point.x - _stickCenter.x;
@@ -818,8 +1260,8 @@ namespace
         else if (touch == _lookTouch)
         {
             // direct camera control: the camera follows the finger
-            _lookAcc.x += (point.x - _lookLast.x) * lookGain;
-            _lookAcc.y += (point.y - _lookLast.y) * lookGain;
+            _lookAcc.x += (point.x - _lookLast.x) * _lookGain;
+            _lookAcc.y += (point.y - _lookLast.y) * _lookGain;
             _lookLast = point;
             const Sint32 ix = static_cast<Sint32>(_lookAcc.x);
             const Sint32 iy = static_cast<Sint32>(_lookAcc.y);
@@ -835,7 +1277,13 @@ namespace
 {
     for (UITouch* touch in touches)
     {
-        if (touch == _stickTouch)
+        if (touch == _dragTouch)
+        {
+            _dragTouch = nil;
+            _dragIndex = -1;
+            [self saveLayout];
+        }
+        else if (touch == _stickTouch)
         {
             _stickTouch = nil;
             _stickOffset = CGPointZero;
@@ -862,9 +1310,9 @@ namespace
         }
         else
         {
-            for (TouchButton& button : _buttons)
-                if (button.touch == touch)
-                    [self lift:button];
+            for (NSInteger i = 0; i < static_cast<NSInteger>(_buttons.size()); ++i)
+                if (_buttons[i].touch == touch)
+                    [self liftButton:i];
         }
     }
 }
@@ -944,6 +1392,18 @@ void OMW::initIosPlatform()
 
 void OMW::configureMetalHud()
 {
+    // The menu size picked in the controls panel. The interface reads its scaling factor once, when the window manager
+    // starts, so it is set here: the settings are loaded, the window is not created yet.
+    @autoreleasepool
+    {
+        id guiScale = [NSUserDefaults.standardUserDefaults objectForKey:kGuiScaleKey];
+        if ([guiScale isKindOfClass:NSNumber.class])
+        {
+            const float value = std::max(0.5f, std::min(1.5f, [guiScale floatValue]));
+            Settings::gui().mScalingFactor.set(value);
+            Log(Debug::Info) << "GUI scaling factor from the controls panel: " << value;
+        }
+    }
     // Off sets nothing; no overwrite: a launch environment can switch the HUD on or off
     const int mode = Settings::video().mMetalHud;
     if (mode == 0)
