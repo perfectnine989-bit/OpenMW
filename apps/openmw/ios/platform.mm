@@ -141,13 +141,30 @@ namespace
         SDL_PushEvent(&event);
     }
 
-    // steps > 0 scrolls up, steps < 0 scrolls down
-    void pushMouseWheel(int steps)
+    // steps > 0 scrolls up, steps < 0 scrolls down; at is where the finger is (the engine moves its cursor there)
+    void pushMouseWheel(int steps, CGPoint at)
     {
         SDL_Event event{};
         event.type = SDL_MOUSEWHEEL;
         event.wheel.y = steps;
+        event.wheel.preciseY = static_cast<float>(steps);
+        event.wheel.mouseX = static_cast<Sint32>(at.x);
+        event.wheel.mouseY = static_cast<Sint32>(at.y);
         event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+        SDL_PushEvent(&event);
+    }
+
+    // Camera movement in the game: mouse movement as the engine's own mouse look takes it (scaled by Options >
+    // Controls > Camera sensitivity). The position stays at the screen centre so the engine never wraps the pointer.
+    void pushLookMotion(Sint32 xrel, Sint32 yrel, CGPoint centre)
+    {
+        SDL_Event event{};
+        event.type = SDL_MOUSEMOTION;
+        event.motion.state = 0;
+        event.motion.x = static_cast<Sint32>(centre.x);
+        event.motion.y = static_cast<Sint32>(centre.y);
+        event.motion.xrel = xrel;
+        event.motion.yrel = yrel;
         SDL_PushEvent(&event);
     }
 
@@ -257,9 +274,9 @@ namespace
 
 namespace
 {
-    // How far a finger has to move per second to push the look stick fully (points/s): smaller = more sensitive.
-    // Was 650. Try 200 for even faster turning, 400 for a bit slower.
-    constexpr CGFloat lookFullSpeed = 300;
+    // Camera speed: how much of the finger's movement the camera follows. Higher = faster turning. On top of it
+    // the engine's own setting applies (Options > Controls > Camera sensitivity, 0.2 to 5).
+    constexpr CGFloat lookGain = 1.8;
     // The walking stick: the finger's distance from where it touched down for full deflection (points at scale 1).
     constexpr CGFloat stickRadiusBase = 64;
     // Touches left of this fraction of the screen width walk, the rest look.
@@ -361,8 +378,8 @@ namespace
     CGFloat _scale;
     UITouch* _lookTouch;
     CGPoint _lookLast;
-    CGPoint _lookDelta; // finger movement since the last frame
-    CGPoint _lookSmooth; // points per second, smoothed over a few frames
+    CGPoint _lookAcc; // fractional camera movement carried to the next event
+    BOOL _guiActive; // a menu, dialog or window is open: the game buttons and sticks are off
     CADisplayLink* _link;
     UIButton* _keyboardButton; // shown only while the on-screen keyboard is up, to hide it
     UITouch* _guiTouch; // the finger that taps, drags or scrolls a menu
@@ -566,6 +583,8 @@ namespace
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     const BOOL active = _stickTouch != nil;
+    _stickBase.hidden = _guiActive;
+    _stickKnob.hidden = _guiActive;
     const CGPoint center = active ? _stickCenter : _stickRest;
     const CGFloat radius = _stickRadius;
     _stickBase.opacity = active ? 1 : 0.6;
@@ -589,20 +608,53 @@ namespace
     [self updateStickLayers];
 }
 
-// the look stick follows how fast the finger moves; it centers by itself when the finger stops
+// the game buttons and the stick only exist while the game is played; in a menu or a dialog only the menu button stays
 - (void)tick:(CADisplayLink*)link
 {
-    if (_lookTouch == nil || _controller == nil)
+    [self syncGui];
+}
+
+- (void)syncGui
+{
+    if (_controller == nil)
         return;
-    const CFTimeInterval frame = link.targetTimestamp - link.timestamp;
-    const CFTimeInterval dt = frame > 0 ? frame : 1.0 / 60;
-    const CGPoint velocity = CGPointMake(_lookDelta.x / dt, _lookDelta.y / dt);
-    _lookDelta = CGPointZero;
-    _lookSmooth.x += (velocity.x - _lookSmooth.x) * 0.5;
-    _lookSmooth.y += (velocity.y - _lookSmooth.y) * 0.5;
-    const CGFloat full = lookFullSpeed * _scale;
-    [_controller setPosition:CGPointMake(clampUnit(_lookSmooth.x / full), clampUnit(-_lookSmooth.y / full))
-        forDirectionPadElement:GCInputRightThumbstick];
+    const BOOL open = guiOpen();
+    if (open != _guiActive)
+        [self setGuiActive:open];
+}
+
+- (void)setGuiActive:(BOOL)active
+{
+    _guiActive = active;
+    // Let go of everything the game was holding. In a menu the engine moves its cursor with the controller's sticks,
+    // so a stick left deflected would drag the cursor away from every tap.
+    _stickTouch = nil;
+    _stickOffset = CGPointZero;
+    _lookTouch = nil;
+    _lookAcc = CGPointZero;
+    [_controller setPosition:CGPointZero forDirectionPadElement:GCInputLeftThumbstick];
+    [_controller setPosition:CGPointZero forDirectionPadElement:GCInputRightThumbstick];
+    for (TouchButton& button : _buttons)
+        if (button.touch != nil && !isKeyButton(button.element))
+            [self lift:button];
+    if (_guiTouch != nil && _guiMode == 2)
+        pushMouseButton(_guiLast, false);
+    _guiTouch = nil;
+    [self updateVisibility];
+}
+
+- (void)updateVisibility
+{
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    for (TouchButton& button : _buttons)
+    {
+        const BOOL hidden = _guiActive && !isKeyButton(button.element);
+        button.circle.hidden = hidden;
+        button.iconLayer.hidden = hidden;
+    }
+    [CATransaction commit];
+    [self updateStickLayers];
 }
 
 // the button under a point, the nearest one when buttons are close; nullptr for none
@@ -612,6 +664,8 @@ namespace
     CGFloat bestScore = 1e9;
     for (TouchButton& button : _buttons)
     {
+        if (_guiActive && !isKeyButton(button.element))
+            continue;
         const CGFloat distance = std::hypot(point.x - button.center.x, point.y - button.center.y);
         if (distance > button.scaledRadius + 10 * _scale)
             continue;
@@ -665,6 +719,7 @@ namespace
 
 - (void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event
 {
+    [self syncGui];
     for (UITouch* touch in touches)
     {
         const CGPoint point = [touch locationInView:self];
@@ -673,7 +728,7 @@ namespace
             if (button->touch == nil)
                 [self press:*button touch:touch];
         }
-        else if (guiOpen())
+        else if (_guiActive)
         {
             // a menu is open: this finger works the menu (tap = click, vertical swipe = scroll, sideways = drag)
             if (_guiTouch == nil)
@@ -699,8 +754,7 @@ namespace
         {
             _lookTouch = touch;
             _lookLast = point;
-            _lookDelta = CGPointZero;
-            _lookSmooth = CGPointZero;
+            _lookAcc = CGPointZero;
         }
     }
 }
@@ -751,7 +805,7 @@ namespace
                 const int steps = static_cast<int>(_scrollAccum / 16);
                 if (steps != 0)
                 {
-                    pushMouseWheel(steps);
+                    pushMouseWheel(steps, point);
                     _scrollAccum -= steps * 16;
                 }
             }
@@ -763,9 +817,16 @@ namespace
         }
         else if (touch == _lookTouch)
         {
-            _lookDelta.x += point.x - _lookLast.x;
-            _lookDelta.y += point.y - _lookLast.y;
+            // direct camera control: the camera follows the finger
+            _lookAcc.x += (point.x - _lookLast.x) * lookGain;
+            _lookAcc.y += (point.y - _lookLast.y) * lookGain;
             _lookLast = point;
+            const Sint32 ix = static_cast<Sint32>(_lookAcc.x);
+            const Sint32 iy = static_cast<Sint32>(_lookAcc.y);
+            _lookAcc.x -= ix;
+            _lookAcc.y -= iy;
+            if (ix != 0 || iy != 0)
+                pushLookMotion(ix, iy, CGPointMake(self.bounds.size.width / 2, self.bounds.size.height / 2));
         }
     }
 }
@@ -797,9 +858,7 @@ namespace
         else if (touch == _lookTouch)
         {
             _lookTouch = nil;
-            _lookDelta = CGPointZero;
-            _lookSmooth = CGPointZero;
-            [_controller setPosition:CGPointZero forDirectionPadElement:GCInputRightThumbstick];
+            _lookAcc = CGPointZero;
         }
         else
         {
