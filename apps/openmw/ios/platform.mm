@@ -33,6 +33,11 @@
 // On-screen controls drawn by the app itself: a floating left stick for walking, a look area on the rest of the
 // screen and buttons around the edges. They drive an invisible GCVirtualController, so the engine sees an ordinary
 // game controller.
+namespace MWRender
+{
+    extern float gCameraDistanceScale; // defined in mwrender/camera.cpp
+}
+
 @interface OMWTouchOverlay : UIView
 - (instancetype)initWithFrame:(CGRect)frame controller:(GCVirtualController*)controller;
 - (void)teardown;
@@ -57,6 +62,7 @@ namespace
     NSString* const kButtonScaleKey = @"omw.buttonScale";
     NSString* const kGuiScaleKey = @"omw.guiScale";
     NSString* const kLayoutKey = @"omw.layout";
+    NSString* const kCameraKey = @"omw.cameraDistance";
 
     // footprint = what iOS counts against the app's memory limit; footprint + available = that limit
     void logMemory(const char* when)
@@ -108,9 +114,19 @@ namespace
 
     // the Menu button is not an element a virtual controller can press, so it sends the Escape key (OpenMW's game menu:
     // save, load, options) straight to the engine instead
+    // (Tab is the engine's third-person view toggle; the close cross is Escape too: it shuts the open window)
+    SDL_Scancode keyFor(NSString* element)
+    {
+        if ([element isEqualToString:@"key:escape"] || [element isEqualToString:@"ui:close"])
+            return SDL_SCANCODE_ESCAPE;
+        if ([element isEqualToString:@"key:tab"])
+            return SDL_SCANCODE_TAB;
+        return SDL_SCANCODE_UNKNOWN;
+    }
+
     bool isKeyButton(NSString* element)
     {
-        return [element isEqualToString:@"key:escape"];
+        return keyFor(element) != SDL_SCANCODE_UNKNOWN;
     }
 
     void pushKey(SDL_Scancode scancode, bool down)
@@ -287,6 +303,7 @@ namespace
     constexpr CGFloat defaultOpacity = 0.75, minOpacity = 0.15, maxOpacity = 1;
     constexpr CGFloat defaultButtonScale = 1, minButtonScale = 0.6, maxButtonScale = 1.6;
     constexpr CGFloat minGuiScale = 0.5, maxGuiScale = 1.5;
+    constexpr CGFloat defaultCameraScale = 1.0, minCameraScale = 0.4, maxCameraScale = 3.0;
     // The walking stick: the finger's distance from where it touched down for full deflection (points at scale 1).
     constexpr CGFloat stickRadiusBase = 64;
     // Touches left of this fraction of the screen width walk, the rest look.
@@ -393,10 +410,16 @@ namespace
         return [element isEqualToString:@"ui:settings"];
     }
 
+    // the cross that closes the open window: shown only while one is open
+    bool isCloseButton(NSString* element)
+    {
+        return [element isEqualToString:@"ui:close"];
+    }
+
     // buttons that stay while a menu is open
     bool staysInMenus(NSString* element)
     {
-        return isKeyButton(element) || isUiButton(element);
+        return [element isEqualToString:@"key:escape"] || isCloseButton(element) || isUiButton(element);
     }
 
     // The picture of an icon as an alpha mask. SF Symbols are drawn into a bitmap first, so every icon ends up the same
@@ -451,6 +474,7 @@ namespace
     CGFloat _opacity;
     CGFloat _buttonScale;
     CGFloat _guiScale;
+    CGFloat _cameraScale;
 
     // the panel and the layout editor; the views belong to their superviews
     UIControl* _backdrop;
@@ -458,8 +482,8 @@ namespace
     UIScrollView* _scroll;
     UILabel* _panelTitle;
     UIButton* _panelClose;
-    UILabel* _labels[4];
-    UISlider* _sliders[4];
+    UILabel* _labels[5];
+    UISlider* _sliders[5];
     UIButton* _editButton;
     UIButton* _resetButton;
     UIControl* _editBar;
@@ -486,6 +510,8 @@ namespace
         _opacity = savedValue(kOpacityKey, defaultOpacity, minOpacity, maxOpacity);
         _buttonScale = savedValue(kButtonScaleKey, defaultButtonScale, minButtonScale, maxButtonScale);
         _guiScale = savedValue(kGuiScaleKey, Settings::gui().mScalingFactor.get(), minGuiScale, maxGuiScale);
+        _cameraScale = savedValue(kCameraKey, defaultCameraScale, minCameraScale, maxCameraScale);
+        MWRender::gCameraDistanceScale = static_cast<float>(_cameraScale);
         self.multipleTouchEnabled = YES;
         self.backgroundColor = UIColor.clearColor;
         self.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -516,6 +542,8 @@ namespace
             { @"gearshape.fill", @"ui:settings", TopRight, 138, 30, 22 }, // controls panel
             { @"book.fill", GCInputLeftShoulder, TopLeft, 30, 30, 22 }, // journal
             { @"eye.slash.fill", GCInputLeftThumbstickButton, TopLeft, 84, 30, 22 }, // sneak
+            { @"person.fill", @"key:tab", TopLeft, 138, 30, 22 }, // third-person view
+            { @"xmark", @"ui:close", TopRight, 192, 30, 22 }, // close the open window
         };
         for (TouchButton button : specs)
         {
@@ -643,9 +671,9 @@ namespace
     [_panel addSubview:_scroll];
     [_scroll release];
 
-    const CGFloat lows[4] = { minLookGain, minOpacity, minButtonScale, minGuiScale };
-    const CGFloat highs[4] = { maxLookGain, maxOpacity, maxButtonScale, maxGuiScale };
-    for (int i = 0; i < 4; ++i)
+    const CGFloat lows[5] = { minLookGain, minOpacity, minButtonScale, minGuiScale, minCameraScale };
+    const CGFloat highs[5] = { maxLookGain, maxOpacity, maxButtonScale, maxGuiScale, maxCameraScale };
+    for (int i = 0; i < 5; ++i)
     {
         UILabel* label = [[UILabel alloc] init];
         label.textColor = UIColor.whiteColor;
@@ -699,6 +727,7 @@ namespace
     _sliders[1].value = static_cast<float>(_opacity);
     _sliders[2].value = static_cast<float>(_buttonScale);
     _sliders[3].value = static_cast<float>(_guiScale);
+    _sliders[4].value = static_cast<float>(_cameraScale);
 }
 
 - (void)updateLabels
@@ -708,6 +737,7 @@ namespace
     _labels[2].text = [NSString stringWithFormat:@"Размер кнопок: %d%%", static_cast<int>(std::lround(_buttonScale * 100))];
     _labels[3].text = [NSString
         stringWithFormat:@"Размер меню игры: %.2f (применится после перезапуска игры)", _guiScale];
+    _labels[4].text = [NSString stringWithFormat:@"Дистанция камеры от 3-го лица: x%.2f", _cameraScale];
 }
 
 - (void)sliderChanged:(UISlider*)slider
@@ -728,6 +758,11 @@ namespace
             _buttonScale = value;
             saveValue(kButtonScaleKey, value);
             [self setNeedsLayout];
+            break;
+        case 4:
+            _cameraScale = std::round(value * 20) / 20;
+            saveValue(kCameraKey, _cameraScale);
+            MWRender::gCameraDistanceScale = static_cast<float>(_cameraScale);
             break;
         default:
             // steps of 0.05; the interface reads its scale once at launch (configureMetalHud)
@@ -761,6 +796,9 @@ namespace
     _buttonScale = defaultButtonScale;
     _guiScale = 1;
     saveValue(kGuiScaleKey, _guiScale);
+    _cameraScale = defaultCameraScale;
+    saveValue(kCameraKey, _cameraScale);
+    MWRender::gCameraDistanceScale = 1.f;
     for (TouchButton& button : _buttons)
     {
         button.dx = button.dx0;
@@ -937,12 +975,12 @@ namespace
     _panelClose.frame = CGRectMake(width - 94, 8, 82, 32);
     _scroll.frame = CGRectMake(0, 44, width, height - 44);
     const CGFloat rowHeight = 72;
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < 5; ++i)
     {
         _labels[i].frame = CGRectMake(16, 4 + i * rowHeight, width - 32, 34);
         _sliders[i].frame = CGRectMake(16, 40 + i * rowHeight, width - 32, 28);
     }
-    const CGFloat buttonsY = 4 + 4 * rowHeight + 4;
+    const CGFloat buttonsY = 4 + 5 * rowHeight + 4;
     const CGFloat half = (width - 44) / 2;
     _editButton.frame = CGRectMake(16, buttonsY, half, 40);
     _resetButton.frame = CGRectMake(28 + half, buttonsY, half, 40);
@@ -1052,7 +1090,11 @@ namespace
 
 - (BOOL)shown:(const TouchButton&)button
 {
-    return _editMode || !_guiActive || staysInMenus(button.element);
+    if (_editMode)
+        return YES;
+    if (isCloseButton(button.element))
+        return _guiActive;
+    return !_guiActive || staysInMenus(button.element);
 }
 
 - (void)updateVisibility
@@ -1100,7 +1142,7 @@ namespace
     button.touch = touch;
     button.pressedAt = CACurrentMediaTime();
     if (isKeyButton(button.element))
-        pushKey(SDL_SCANCODE_ESCAPE, true);
+        pushKey(keyFor(button.element), true);
     else if (!isUiButton(button.element))
         [_controller setValue:1 forButtonElement:button.element];
     [self styleButton:button pressed:YES];
@@ -1119,7 +1161,7 @@ namespace
     }
     if (isKeyButton(button.element))
     {
-        pushKey(SDL_SCANCODE_ESCAPE, false);
+        pushKey(keyFor(button.element), false);
         return;
     }
     const CFTimeInterval held = CACurrentMediaTime() - button.pressedAt;
@@ -1404,6 +1446,12 @@ void OMW::configureMetalHud()
             Log(Debug::Info) << "GUI scaling factor from the controls panel: " << value;
         }
     }
+    // Pinned windows (inventory, map, spells, stats) stay on the screen in the game and cannot be closed by touch:
+    // start every launch with all of them unpinned.
+    Settings::windows().mInventoryPin.set(false);
+    Settings::windows().mMapPin.set(false);
+    Settings::windows().mSpellsPin.set(false);
+    Settings::windows().mStatsPin.set(false);
     // Off sets nothing; no overwrite: a launch environment can switch the HUD on or off
     const int mode = Settings::video().mMetalHud;
     if (mode == 0)
