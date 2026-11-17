@@ -193,7 +193,8 @@ namespace MWRender
         }
 
         // Adjust camera distance.
-        mCameraDistance = mPreferredCameraDistance;
+        extern float gCameraDistanceScale; // set by the iOS controls panel (ios/platform.mm)
+        mCameraDistance = mPreferredCameraDistance * gCameraDistanceScale;
         osg::Quat orient
             = osg::Quat(mPitch + mExtraPitch, osg::Vec3d(1, 0, 0)) * osg::Quat(mYaw + mExtraYaw, osg::Vec3d(0, 0, 1));
         osg::Vec3d offset = orient * osg::Vec3d(0.f, -mCameraDistance, 0.f);
