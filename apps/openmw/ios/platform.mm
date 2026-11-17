@@ -35,7 +35,7 @@
 // game controller.
 namespace MWRender
 {
-    extern float gCameraDistanceScale; // defined in mwrender/camera.cpp
+    float gCameraDistanceScale = 1.f; // read by mwrender/camera.cpp
 }
 
 @interface OMWTouchOverlay : UIView
